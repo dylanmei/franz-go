@@ -87,6 +87,91 @@ func Test848RegexSubscription(t *testing.T) {
 	}
 }
 
+func TestListGroupsGroupType(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name      string
+		version   int16
+		groupType string
+		opts      []kgo.Opt
+		config    map[string]string
+	}{
+		{
+			name:    "v4-classic",
+			version: 4,
+			opts:    []kgo.Opt{kgo.ConsumerGroup("group")},
+		},
+		{
+			name:      "v5-classic",
+			version:   5,
+			groupType: "classic",
+			opts:      []kgo.Opt{kgo.ConsumerGroup("group")},
+		},
+		{
+			name:      "v5-consumer",
+			version:   5,
+			groupType: "consumer",
+			opts:      []kgo.Opt{kgo.ConsumerGroup("group"), kgo.ServerSideBalancer()},
+		},
+		{
+			name:      "v5-share",
+			version:   5,
+			groupType: "share",
+			opts:      []kgo.Opt{kgo.ShareGroup("group")},
+			config:    map[string]string{"share.auto.offset.reset": "earliest"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			versions := kversion.Stable()
+			versions.SetMaxKeyVersion(int16(kmsg.ListGroups), test.version)
+			c := newCluster(t, NumBrokers(1), SeedTopics(1, "topic"), MaxVersions(versions))
+			if len(test.config) != 0 {
+				c.SetGroupConfigs("group", test.config)
+			}
+			producer := newPlainClient(t, c)
+			produceNStrings(t, producer, "topic", 1)
+
+			opts := append([]kgo.Opt{
+				kgo.ConsumeTopics("topic"),
+				kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+			}, test.opts...)
+			consumer := newPlainClient(t, c, opts...)
+			consumeN(t, consumer, 1, 5*time.Second)
+
+			c.ControlKey(int16(kmsg.ListGroups), func(kreq kmsg.Request) (kmsg.Response, error, bool) {
+				req := kreq.(*kmsg.ListGroupsRequest)
+				if req.Version != test.version {
+					t.Errorf("ListGroups version = %d, want %d", req.Version, test.version)
+				}
+				if len(req.TypesFilter) != 0 {
+					t.Errorf("unfiltered ListGroups sent type filter %v", req.TypesFilter)
+				}
+				c.DropControl()
+				return nil, nil, false
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			adm := kadm.NewClient(newPlainClient(t, c))
+			listed, err := adm.ListGroups(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != 1 {
+				t.Fatalf("listed groups = %v, want only group", listed.Groups())
+			}
+			group, ok := listed["group"]
+			if !ok {
+				t.Fatal("group not found")
+			}
+			if group.GroupType != test.groupType {
+				t.Errorf("group type = %q, want %q", group.GroupType, test.groupType)
+			}
+		})
+	}
+}
+
 // Test848GroupTypeIsConsumer verifies that a KIP-848 consumer group is
 // reported with type "consumer" in ListGroups, confirming the client is
 // actually using the 848 protocol and not falling back to classic.
